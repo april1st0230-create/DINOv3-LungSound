@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # DINOv3-LungSound
 
 This repository contains the implementation used for the final project:
@@ -140,6 +139,4 @@ The representation analysis showed that DINOv3 embeddings did not naturally form
 - Update all paths according to your local environment.
 - The ICBHI dataset itself is not included in this repository.
 - Large model checkpoints and generated outputs are ignored by `.gitignore`.
-=======
-# DINOv3-LungSound
->>>>>>> 81b7f3c206f9203a9f61a58b2c8e79da729aa47d
+
