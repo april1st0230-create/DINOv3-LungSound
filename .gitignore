@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environment
+.venv/
+venv/
+env/
+*.conda
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and outputs
+data/
+dataset/
+datasets/
+ICBHI_final_database/
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# Large experiment outputs
+results/*
+figures/*
+checkpoints/*
+outputs/*
+dinov3_outputs/*
+dinov3_finetune_outputs/*
+dinov3_focal_finetune_outputs/*
+cnn_baseline_outputs/*
+resnet18_baseline_outputs/*
+
+# Keep folders
+!results/.gitkeep
+!figures/.gitkeep
+!checkpoints/.gitkeep
