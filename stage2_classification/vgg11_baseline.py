@@ -1,78 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+CNN baseline with VGG11-BN backbone and handcrafted audio feature fusion.
+
+Input cache files should contain:
+    image cache .pt:
+        {"X": Tensor[N,3,224,224], "y": Tensor[N]}
+    handcrafted feature .pt:
+        {"X": Tensor[N,AUDIO_DIM]}
+"""
+
 import os
-import copy
 import argparse
+import random
+import copy
 import numpy as np
 import pandas as pd
-from PIL import Image
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
-from sklearn.metrics import classification_report
+from torchvision import models
+from torchvision.models import VGG11_BN_Weights
 
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import set_seed, resolve_image_paths, check_missing_images, compute_metrics, LABEL_ORDER
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    confusion_matrix, roc_auc_score, classification_report
+)
+from sklearn.preprocessing import label_binarize
 
 
-class LungImageDataset(Dataset):
-    def __init__(self, dataframe, transform=None):
-        self.df = dataframe.reset_index(drop=True)
-        self.transform = transform
+CLASS_NAMES = ["normal", "crackle", "wheeze", "both"]
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def load_split_cache(path_cache, path_feat, audio_dim):
+    b = torch.load(path_cache, map_location="cpu")
+    X_img = b["X"].float()
+    y = b["y"].long()
+
+    f = torch.load(path_feat, map_location="cpu")
+    X_aud = f["X"].float()
+
+    assert len(X_img) == len(y) == len(X_aud)
+    assert X_aud.shape[1] == audio_dim
+
+    return X_img, y, X_aud
+
+
+class MelCachedDataset(Dataset):
+    def __init__(self, X, A, y, mean_img, std_img, mean_aud, std_aud):
+        self.X = X
+        self.A = A
+        self.y = y
+        self.mean_img = mean_img.view(3, 1, 1)
+        self.std_img = torch.where(std_img == 0, torch.ones_like(std_img), std_img).view(3, 1, 1)
+        self.mean_aud = mean_aud.view(-1)
+        self.std_aud = torch.where(std_aud == 0, torch.ones_like(std_aud), std_aud).view(-1)
 
     def __len__(self):
-        return len(self.df)
+        return self.X.shape[0]
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        image = Image.open(row["image_path"]).convert("RGB")
-        label = int(row["label_id"])
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, torch.tensor(label, dtype=torch.long)
+    def __getitem__(self, i):
+        x = (self.X[i] - self.mean_img) / self.std_img
+        a = (self.A[i] - self.mean_aud) / self.std_aud
+        return x, a, int(self.y[i])
 
 
-def build_model(model_type, num_classes=4):
-    if model_type == "vgg11_bn":
-        model = models.vgg11_bn(weights=models.VGG11_BN_Weights.IMAGENET1K_V1)
-        in_features = model.classifier[-1].in_features
-        model.classifier[-1] = nn.Linear(in_features, num_classes)
-        return model
+class VGG11AudioConcat(nn.Module):
+    def __init__(self, num_classes=4, audio_dim=5):
+        super().__init__()
 
-    if model_type == "resnet18":
-        model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
-        return model
+        vgg = models.vgg11_bn(weights=VGG11_BN_Weights.IMAGENET1K_V1)
+        self.features = vgg.features
+        self.img_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.drop2d = nn.Dropout2d(p=0.2)
+        self.flat = nn.Flatten()
 
-    raise ValueError(f"Unknown model_type: {model_type}")
+        self.img_dim = 512
+
+        self.head = nn.Sequential(
+            nn.Linear(self.img_dim + audio_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x, a):
+        z = self.features(x)
+        z = self.drop2d(z)
+        z = self.img_pool(z)
+        z = self.flat(z)
+        z = F.normalize(z, dim=1)
+        return self.head(torch.cat([z, a], dim=1))
 
 
+def compute_metrics(y_true, y_pred, y_prob):
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    macro_precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    macro_recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])
+    specificities = []
+
+    for i in range(4):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        specificities.append(tn / (tn + fp) if (tn + fp) > 0 else 0)
+
+    macro_sp = np.mean(specificities)
+    macro_balacc = (macro_recall + macro_sp) / 2
+
+    y_bin = label_binarize(y_true, classes=[0, 1, 2, 3])
+    try:
+        macro_auroc = roc_auc_score(y_bin, y_prob, average="macro", multi_class="ovr")
+    except Exception:
+        macro_auroc = np.nan
+
+    return {
+        "accuracy": acc,
+        "macro_precision": macro_precision,
+        "macro_recall_sensitivity": macro_recall,
+        "macro_specificity": macro_sp,
+        "macro_f1": macro_f1,
+        "macro_balanced_accuracy": macro_balacc,
+        "macro_auroc": macro_auroc,
+    }
+
+
+@torch.no_grad()
 def run_eval(model, loader, criterion, device):
     model.eval()
+
     total_loss = 0
     y_true, y_pred, y_prob = [], [], []
 
-    with torch.no_grad():
-        for images, labels in tqdm(loader, leave=False):
-            images = images.to(device)
-            labels = labels.to(device)
+    for images, audio, labels in tqdm(loader, leave=False):
+        images = images.to(device)
+        audio = audio.to(device)
+        labels = labels.to(device)
 
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                logits = model(images)
-                loss = criterion(logits, labels)
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            logits = model(images, audio)
+            loss = criterion(logits, labels)
 
-            prob = torch.softmax(logits, dim=1)
-            pred = torch.argmax(prob, dim=1)
+        prob = torch.softmax(logits, dim=1)
+        pred = torch.argmax(prob, dim=1)
 
-            total_loss += loss.item() * labels.size(0)
-            y_true.extend(labels.cpu().numpy())
-            y_pred.extend(pred.cpu().numpy())
-            y_prob.extend(prob.cpu().numpy())
+        total_loss += loss.item() * labels.size(0)
+        y_true.extend(labels.cpu().numpy())
+        y_pred.extend(pred.cpu().numpy())
+        y_prob.extend(prob.cpu().numpy())
 
     metrics = compute_metrics(np.array(y_true), np.array(y_pred), np.array(y_prob))
     metrics["loss"] = total_loss / len(loader.dataset)
@@ -80,72 +168,87 @@ def run_eval(model, loader, criterion, device):
     return metrics, np.array(y_true), np.array(y_pred), np.array(y_prob)
 
 
-def train_cnn(args):
-    set_seed(args.seed)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_cache", type=str, required=True)
+    parser.add_argument("--val_cache", type=str, required=True)
+    parser.add_argument("--test_cache", type=str, required=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    parser.add_argument("--train_feat", type=str, required=True)
+    parser.add_argument("--val_feat", type=str, required=True)
+    parser.add_argument("--test_feat", type=str, required=True)
+
+    parser.add_argument("--output_dir", type=str, required=True)
+
+    parser.add_argument("--audio_dim", type=int, default=5)
+    parser.add_argument("--num_classes", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=3e-4)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("DEVICE:", device)
 
-    csv_path = os.path.join(args.root, args.metadata)
-    image_root = os.path.join(args.root, args.image_dir)
-    out_dir = os.path.join(args.root, args.out_dir)
-    os.makedirs(out_dir, exist_ok=True)
+    X_tr, y_tr, A_tr = load_split_cache(args.train_cache, args.train_feat, args.audio_dim)
+    X_va, y_va, A_va = load_split_cache(args.val_cache, args.val_feat, args.audio_dim)
+    X_te, y_te, A_te = load_split_cache(args.test_cache, args.test_feat, args.audio_dim)
 
-    df = pd.read_csv(csv_path)
-    df = resolve_image_paths(df, image_root)
-    check_missing_images(df)
+    with torch.no_grad():
+        mean_img = X_tr.mean(dim=(0, 2, 3))
+        std_img = X_tr.std(dim=(0, 2, 3))
+        mean_aud = A_tr.mean(dim=0)
+        std_aud = A_tr.std(dim=0)
 
-    train_tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomApply([
-            transforms.RandomAffine(
-                degrees=args.degrees,
-                translate=(args.translate, args.translate),
-                scale=(0.95, 1.05)
-            )
-        ], p=args.affine_p),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    train_loader = DataLoader(
+        MelCachedDataset(X_tr, A_tr, y_tr, mean_img, std_img, mean_aud, std_aud),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        MelCachedDataset(X_va, A_va, y_va, mean_img, std_img, mean_aud, std_aud),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    test_loader = DataLoader(
+        MelCachedDataset(X_te, A_te, y_te, mean_img, std_img, mean_aud, std_aud),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
 
-    eval_tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    model = VGG11AudioConcat(
+        num_classes=args.num_classes,
+        audio_dim=args.audio_dim,
+    ).to(device)
 
-    train_df = df[df["split"] == "train"].reset_index(drop=True)
-    val_df = df[df["split"] == "val"].reset_index(drop=True)
-    test_df = df[df["split"] == "test"].reset_index(drop=True)
-
-    train_loader = DataLoader(LungImageDataset(train_df, train_tf), batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(LungImageDataset(val_df, eval_tf), batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(LungImageDataset(test_df, eval_tf), batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-    model = build_model(args.model_type, args.num_classes).to(device)
-
-    class_counts = train_df["label_id"].value_counts().sort_index().values
+    class_counts = torch.bincount(y_tr, minlength=args.num_classes).float()
     class_weights = class_counts.sum() / (args.num_classes * class_counts)
-    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    class_weights = class_weights.to(device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
     )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=args.epochs
+        T_max=args.epochs,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
     bad_epochs = 0
@@ -155,16 +258,17 @@ def train_cnn(args):
         model.train()
         running_loss = 0
 
-        pbar = tqdm(train_loader, desc=f"{args.model_type} Epoch {epoch}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"VGG11-BN Epoch {epoch}/{args.epochs}")
 
-        for images, labels in pbar:
+        for images, audio, labels in pbar:
             images = images.to(device)
+            audio = audio.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                logits = model(images)
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                logits = model(images, audio)
                 loss = criterion(logits, labels)
 
             scaler.scale(loss).backward()
@@ -181,70 +285,56 @@ def train_cnn(args):
         row = {
             "epoch": epoch,
             "train_loss": running_loss / len(train_loader),
-            **{f"val_{k}": v for k, v in val_metrics.items()}
+            **{f"val_{k}": v for k, v in val_metrics.items()},
         }
         history.append(row)
         print(row)
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            torch.save(model.state_dict(), os.path.join(out_dir, f"best_{args.model_type}.pt"))
+            best_state = copy.deepcopy(model.state_dict())
+            torch.save(best_state, os.path.join(args.output_dir, "best_vgg11_bn.pt"))
             bad_epochs = 0
             print("best model saved")
         else:
             bad_epochs += 1
-            print("bad_epochs:", bad_epochs)
 
         if bad_epochs >= args.patience:
             print("Early stopping")
             break
 
-    model.load_state_dict(torch.load(os.path.join(out_dir, f"best_{args.model_type}.pt"), map_location=device))
+    model.load_state_dict(torch.load(
+        os.path.join(args.output_dir, "best_vgg11_bn.pt"),
+        map_location=device,
+    ))
 
     val_metrics, val_true, val_pred, _ = run_eval(model, val_loader, criterion, device)
     test_metrics, test_true, test_pred, _ = run_eval(model, test_loader, criterion, device)
 
     print("VAL:", val_metrics)
     print("TEST:", test_metrics)
+
     print("\n===== VAL report =====")
-    print(classification_report(val_true, val_pred, target_names=LABEL_ORDER, digits=4, zero_division=0))
+    print(classification_report(val_true, val_pred, target_names=CLASS_NAMES, digits=4, zero_division=0))
+
     print("\n===== TEST report =====")
-    print(classification_report(test_true, test_pred, target_names=LABEL_ORDER, digits=4, zero_division=0))
+    print(classification_report(test_true, test_pred, target_names=CLASS_NAMES, digits=4, zero_division=0))
 
-    result_df = pd.DataFrame([
-        {"model": args.model_type, "split": "val", **val_metrics},
-        {"model": args.model_type, "split": "test", **test_metrics},
-    ])
-    result_df.to_csv(os.path.join(out_dir, f"{args.model_type}_results.csv"), index=False, encoding="utf-8-sig")
-    pd.DataFrame(history).to_csv(os.path.join(out_dir, f"{args.model_type}_history.csv"), index=False, encoding="utf-8-sig")
+    pd.DataFrame([
+        {"model": "VGG11_BN_AudioConcat", "split": "val", **val_metrics},
+        {"model": "VGG11_BN_AudioConcat", "split": "test", **test_metrics},
+    ]).to_csv(
+        os.path.join(args.output_dir, "vgg11_bn_results.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
 
-
-def get_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, required=True)
-    parser.add_argument("--metadata", type=str, default="dinov3_patient_split_metadata.csv")
-    parser.add_argument("--image_dir", type=str, default="logmel_delta_deltadelta_3ch_224")
-    parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--model_type", type=str, default="vgg11_bn", choices=["vgg11_bn", "resnet18"])
-    parser.add_argument("--num_classes", type=int, default=4)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--degrees", type=float, default=5)
-    parser.add_argument("--translate", type=float, default=0.03)
-    parser.add_argument("--affine_p", type=float, default=0.3)
-    return parser
+    pd.DataFrame(history).to_csv(
+        os.path.join(args.output_dir, "vgg11_bn_history.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 if __name__ == "__main__":
-    parser = get_parser()
-    args = parser.parse_args()
-
-    if args.out_dir is None:
-        args.out_dir = "cnn_baseline_outputs"
-
-    args.model_type = "vgg11_bn"
-    train_cnn(args)
+    main()
