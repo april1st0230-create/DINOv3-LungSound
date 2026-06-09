@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import argparse
 import numpy as np
@@ -11,9 +12,7 @@ from sklearn.metrics import (
     confusion_matrix, classification_report, roc_auc_score
 )
 
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import LABEL_ORDER
+LABEL_ORDER = ["normal", "crackle", "wheeze", "both"]
 
 
 def compute_specificity_per_class(y_true, y_pred, num_classes=4):
@@ -25,32 +24,28 @@ def compute_specificity_per_class(y_true, y_pred, num_classes=4):
         fn = cm[i, :].sum() - tp
         fp = cm[:, i].sum() - tp
         tn = cm.sum() - tp - fn - fp
-        sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-        specificities.append(sp)
+        specificities.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
 
     return np.array(specificities)
 
 
 def evaluate_model(name, model, X_data, y_data, split_name):
     pred = model.predict(X_data)
-    prob = model.predict_proba(X_data) if hasattr(model, "predict_proba") else None
+    prob = model.predict_proba(X_data)
 
     acc = accuracy_score(y_data, pred)
     macro_f1 = f1_score(y_data, pred, average="macro", zero_division=0)
     macro_precision = precision_score(y_data, pred, average="macro", zero_division=0)
     macro_recall = recall_score(y_data, pred, average="macro", zero_division=0)
 
-    sp_per_class = compute_specificity_per_class(y_data, pred, num_classes=4)
+    sp_per_class = compute_specificity_per_class(y_data, pred)
     macro_sp = sp_per_class.mean()
     macro_balacc = (macro_recall + macro_sp) / 2
 
-    if prob is not None:
-        y_bin = label_binarize(y_data, classes=[0, 1, 2, 3])
-        try:
-            macro_auroc = roc_auc_score(y_bin, prob, average="macro", multi_class="ovr")
-        except Exception:
-            macro_auroc = np.nan
-    else:
+    y_bin = label_binarize(y_data, classes=[0, 1, 2, 3])
+    try:
+        macro_auroc = roc_auc_score(y_bin, prob, average="macro", multi_class="ovr")
+    except Exception:
         macro_auroc = np.nan
 
     result = {
@@ -62,17 +57,13 @@ def evaluate_model(name, model, X_data, y_data, split_name):
         "macro_specificity": macro_sp,
         "macro_f1": macro_f1,
         "macro_balanced_accuracy": macro_balacc,
-        "macro_auroc": macro_auroc
+        "macro_auroc": macro_auroc,
     }
 
     print(f"\n===== {name} / {split_name} =====")
     print(result)
     print(classification_report(
-        y_data,
-        pred,
-        target_names=LABEL_ORDER,
-        digits=4,
-        zero_division=0
+        y_data, pred, target_names=LABEL_ORDER, digits=4, zero_division=0
     ))
 
     return result
@@ -80,17 +71,18 @@ def evaluate_model(name, model, X_data, y_data, split_name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, default="dinov3_outputs")
-    parser.add_argument("--embedding_key", type=str, default="cls_embeddings",
-                        choices=["cls_embeddings", "mean_token_embeddings"])
+    parser.add_argument("--embedding_npz", type=str, required=True)
+    parser.add_argument("--metadata_csv", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--embedding_type", type=str, default="cls", choices=["cls", "mean"])
     args = parser.parse_args()
 
-    out_dir = os.path.join(args.root, args.out_dir)
-    emb = np.load(os.path.join(out_dir, "dinov3_vitl16_embeddings.npz"))
-    meta = pd.read_csv(os.path.join(out_dir, "dinov3_embedding_metadata.csv"))
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    X = emb[args.embedding_key]
+    emb = np.load(args.embedding_npz)
+    meta = pd.read_csv(args.metadata_csv)
+
+    X = emb["cls_embeddings"] if args.embedding_type == "cls" else emb["mean_token_embeddings"]
     y = emb["labels"]
 
     train_mask = meta["split"] == "train"
@@ -113,20 +105,20 @@ def main():
         class_weight="balanced",
         max_iter=3000,
         solver="lbfgs",
-        random_state=42
+        random_state=42,
     )
     linear_clf.fit(X_train_s, y_train)
 
     for split_name, X_data, y_data in [
         ("val", X_val_s, y_val),
-        ("test", X_test_s, y_test)
+        ("test", X_test_s, y_test),
     ]:
         results.append(evaluate_model(
-            f"DINOv3_{args.embedding_key}_Linear",
+            f"DINOv3_{args.embedding_type}_Linear",
             linear_clf,
             X_data,
             y_data,
-            split_name
+            split_name,
         ))
 
     mlp_clf = MLPClassifier(
@@ -141,25 +133,26 @@ def main():
         validation_fraction=0.15,
         n_iter_no_change=20,
         random_state=42,
-        verbose=True
+        verbose=True,
     )
     mlp_clf.fit(X_train_s, y_train)
 
     for split_name, X_data, y_data in [
         ("val", X_val_s, y_val),
-        ("test", X_test_s, y_test)
+        ("test", X_test_s, y_test),
     ]:
         results.append(evaluate_model(
-            f"DINOv3_{args.embedding_key}_MLP",
+            f"DINOv3_{args.embedding_type}_MLP",
             mlp_clf,
             X_data,
             y_data,
-            split_name
+            split_name,
         ))
 
     result_df = pd.DataFrame(results)
-    result_path = os.path.join(out_dir, f"probe_results_{args.embedding_key}.csv")
+    result_path = os.path.join(args.output_dir, f"probe_results_{args.embedding_type}.csv")
     result_df.to_csv(result_path, index=False, encoding="utf-8-sig")
+
     print("Saved:", result_path)
 
 
