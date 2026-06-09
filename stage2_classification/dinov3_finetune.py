@@ -1,6 +1,8 @@
+# -*- coding: utf-8 -*-
 import os
 import copy
 import argparse
+import random
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -10,29 +12,60 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoImageProcessor, AutoModel
-from sklearn.metrics import classification_report
 
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import set_seed, resolve_image_paths, check_missing_images, compute_metrics, LABEL_ORDER
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    confusion_matrix, roc_auc_score, classification_report
+)
+from sklearn.preprocessing import label_binarize
+
+
+LABEL_ORDER = ["normal", "crackle", "wheeze", "both"]
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 class LungImageDataset(Dataset):
-    def __init__(self, dataframe, processor):
+    def __init__(self, dataframe, processor, image_root=None):
         self.df = dataframe.reset_index(drop=True)
         self.processor = processor
+        self.image_root = image_root
 
     def __len__(self):
         return len(self.df)
 
+    def _resolve_path(self, row):
+        path = str(row["image_path"])
+
+        if os.path.exists(path):
+            return path
+
+        if self.image_root is not None:
+            alt_path = os.path.join(
+                self.image_root,
+                str(row["label"]),
+                os.path.basename(path)
+            )
+            if os.path.exists(alt_path):
+                return alt_path
+
+        raise FileNotFoundError(f"Image not found: {path}")
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image = Image.open(row["image_path"]).convert("RGB")
+        image = Image.open(self._resolve_path(row)).convert("RGB")
         label = int(row["label_id"])
+
         inputs = self.processor(images=image, return_tensors="pt")
+
         return {
             "pixel_values": inputs["pixel_values"].squeeze(0),
-            "label": torch.tensor(label, dtype=torch.long)
+            "label": torch.tensor(label, dtype=torch.long),
         }
 
 
@@ -41,51 +74,91 @@ class DINOv3Classifier(nn.Module):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         hidden_size = self.backbone.config.hidden_size
+
         self.classifier = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_classes)
+            nn.Linear(hidden_size, num_classes),
         )
 
     def forward(self, pixel_values):
         outputs = self.backbone(pixel_values=pixel_values)
         cls_emb = outputs.last_hidden_state[:, 0, :]
-        return self.classifier(cls_emb)
+        logits = self.classifier(cls_emb)
+        return logits
 
 
+def compute_metrics(y_true, y_pred, y_prob):
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    macro_precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    macro_recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])
+    specificities = []
+
+    for i in range(4):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        specificities.append(tn / (tn + fp) if (tn + fp) > 0 else 0)
+
+    macro_sp = np.mean(specificities)
+    macro_balacc = (macro_recall + macro_sp) / 2
+
+    y_bin = label_binarize(y_true, classes=[0, 1, 2, 3])
+    try:
+        macro_auroc = roc_auc_score(y_bin, y_prob, average="macro", multi_class="ovr")
+    except Exception:
+        macro_auroc = np.nan
+
+    return {
+        "accuracy": acc,
+        "macro_precision": macro_precision,
+        "macro_recall_sensitivity": macro_recall,
+        "macro_specificity": macro_sp,
+        "macro_f1": macro_f1,
+        "macro_balanced_accuracy": macro_balacc,
+        "macro_auroc": macro_auroc,
+    }
+
+
+@torch.no_grad()
 def run_eval(model, loader, criterion, device):
     model.eval()
+
     total_loss = 0
     y_true, y_pred, y_prob = [], [], []
 
-    with torch.no_grad():
-        for batch in tqdm(loader, leave=False):
-            pixel_values = batch["pixel_values"].to(device)
-            labels = batch["label"].to(device)
+    for batch in tqdm(loader, leave=False):
+        pixel_values = batch["pixel_values"].to(device)
+        labels = batch["label"].to(device)
 
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                logits = model(pixel_values)
-                loss = criterion(logits, labels)
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            logits = model(pixel_values)
+            loss = criterion(logits, labels)
 
-            prob = torch.softmax(logits, dim=1)
-            pred = torch.argmax(prob, dim=1)
+        prob = torch.softmax(logits, dim=1)
+        pred = torch.argmax(prob, dim=1)
 
-            total_loss += loss.item() * labels.size(0)
-            y_true.extend(labels.cpu().numpy())
-            y_pred.extend(pred.cpu().numpy())
-            y_prob.extend(prob.cpu().numpy())
+        total_loss += loss.item() * labels.size(0)
+        y_true.extend(labels.cpu().numpy())
+        y_pred.extend(pred.cpu().numpy())
+        y_prob.extend(prob.cpu().numpy())
 
+    avg_loss = total_loss / len(loader.dataset)
     metrics = compute_metrics(np.array(y_true), np.array(y_pred), np.array(y_prob))
-    metrics["loss"] = total_loss / len(loader.dataset)
+    metrics["loss"] = avg_loss
+
     return metrics, np.array(y_true), np.array(y_pred), np.array(y_prob)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, required=True)
-    parser.add_argument("--metadata", type=str, default="dinov3_patient_split_metadata.csv")
-    parser.add_argument("--image_dir", type=str, default="logmel_delta_deltadelta_3ch_224")
-    parser.add_argument("--out_dir", type=str, default="dinov3_finetune_outputs")
+    parser.add_argument("--metadata_csv", type=str, required=True)
+    parser.add_argument("--image_root", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="facebook/dinov3-vitl16-pretrain-lvd1689m")
     parser.add_argument("--num_classes", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -98,28 +171,37 @@ def main():
     args = parser.parse_args()
 
     set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("DEVICE:", device)
 
-    csv_path = os.path.join(args.root, args.metadata)
-    image_root = os.path.join(args.root, args.image_dir)
-    out_dir = os.path.join(args.root, args.out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-
-    df = pd.read_csv(csv_path)
-    df = resolve_image_paths(df, image_root)
-    check_missing_images(df)
-
-    processor = AutoImageProcessor.from_pretrained(args.model_name)
+    df = pd.read_csv(args.metadata_csv)
 
     train_df = df[df["split"] == "train"].reset_index(drop=True)
     val_df = df[df["split"] == "val"].reset_index(drop=True)
     test_df = df[df["split"] == "test"].reset_index(drop=True)
 
-    train_loader = DataLoader(LungImageDataset(train_df, processor), batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(LungImageDataset(val_df, processor), batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(LungImageDataset(test_df, processor), batch_size=args.batch_size, shuffle=False, num_workers=0)
+    processor = AutoImageProcessor.from_pretrained(args.model_name)
+
+    train_loader = DataLoader(
+        LungImageDataset(train_df, processor, args.image_root),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        LungImageDataset(val_df, processor, args.image_root),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    test_loader = DataLoader(
+        LungImageDataset(test_df, processor, args.image_root),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
 
     model = DINOv3Classifier(args.model_name, args.num_classes).to(device)
 
@@ -150,10 +232,10 @@ def main():
             {"params": head_params, "lr": args.lr_head},
             {"params": backbone_params, "lr": args.lr_backbone},
         ],
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
     history = []
@@ -169,7 +251,7 @@ def main():
             pixel_values = batch["pixel_values"].to(device)
             labels = batch["label"].to(device)
 
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 logits = model(pixel_values)
                 loss = criterion(logits, labels)
                 loss = loss / args.grad_accum
@@ -189,25 +271,31 @@ def main():
         row = {
             "epoch": epoch,
             "train_loss": running_loss / len(train_loader),
-            **{f"val_{k}": v for k, v in val_metrics.items()}
+            **{f"val_{k}": v for k, v in val_metrics.items()},
         }
         history.append(row)
         print(row)
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            torch.save(model.state_dict(), os.path.join(out_dir, "best_dinov3_finetuned.pt"))
+            best_state = copy.deepcopy(model.state_dict())
+            torch.save(best_state, os.path.join(args.output_dir, "best_dinov3_finetuned.pt"))
             print("best model saved")
 
-    model.load_state_dict(torch.load(os.path.join(out_dir, "best_dinov3_finetuned.pt"), map_location=device))
+    model.load_state_dict(torch.load(
+        os.path.join(args.output_dir, "best_dinov3_finetuned.pt"),
+        map_location=device,
+    ))
 
     val_metrics, val_true, val_pred, _ = run_eval(model, val_loader, criterion, device)
     test_metrics, test_true, test_pred, _ = run_eval(model, test_loader, criterion, device)
 
     print("VAL:", val_metrics)
     print("TEST:", test_metrics)
+
     print("\n===== VAL report =====")
     print(classification_report(val_true, val_pred, target_names=LABEL_ORDER, digits=4, zero_division=0))
+
     print("\n===== TEST report =====")
     print(classification_report(test_true, test_pred, target_names=LABEL_ORDER, digits=4, zero_division=0))
 
@@ -215,8 +303,17 @@ def main():
         {"model": "DINOv3_finetune_last2blocks", "split": "val", **val_metrics},
         {"model": "DINOv3_finetune_last2blocks", "split": "test", **test_metrics},
     ])
-    result_df.to_csv(os.path.join(out_dir, "dinov3_finetune_results.csv"), index=False, encoding="utf-8-sig")
-    pd.DataFrame(history).to_csv(os.path.join(out_dir, "dinov3_finetune_history.csv"), index=False, encoding="utf-8-sig")
+    result_df.to_csv(
+        os.path.join(args.output_dir, "dinov3_finetune_results.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    pd.DataFrame(history).to_csv(
+        os.path.join(args.output_dir, "dinov3_finetune_history.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 if __name__ == "__main__":
