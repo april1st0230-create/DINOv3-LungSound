@@ -1,3 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+Analyze DINOv3 embedding space.
+
+This script computes:
+    - Silhouette Score
+    - k-NN validation/test accuracy
+    - Class centroid cosine distance matrix
+
+Input:
+    - dinov3_vitl16_embeddings.npz
+    - dinov3_embedding_metadata.csv
+"""
+
 import os
 import argparse
 import numpy as np
@@ -9,71 +23,137 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import pairwise_distances
 
 
+LABEL_ORDER = ["normal", "crackle", "wheeze", "both"]
+LABEL2ID = {
+    "normal": 0,
+    "crackle": 1,
+    "wheeze": 2,
+    "both": 3,
+}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, default="dinov3_outputs")
-    parser.add_argument("--embedding_key", type=str, default="cls_embeddings",
-                        choices=["cls_embeddings", "mean_token_embeddings"])
+
+    parser.add_argument(
+        "--embedding_npz",
+        type=str,
+        required=True,
+        help="Path to dinov3_vitl16_embeddings.npz."
+    )
+    parser.add_argument(
+        "--metadata_csv",
+        type=str,
+        required=True,
+        help="Path to dinov3_embedding_metadata.csv."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory to save analysis outputs."
+    )
+    parser.add_argument(
+        "--embedding_type",
+        type=str,
+        default="cls",
+        choices=["cls", "mean"],
+        help="Embedding type to analyze."
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=5,
+        help="Number of neighbors for k-NN."
+    )
+
     args = parser.parse_args()
 
-    out_dir = os.path.join(args.root, args.out_dir)
-    emb_path = os.path.join(out_dir, "dinov3_vitl16_embeddings.npz")
-    meta_path = os.path.join(out_dir, "dinov3_embedding_metadata.csv")
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    emb = np.load(emb_path)
-    meta = pd.read_csv(meta_path)
+    emb = np.load(args.embedding_npz)
+    meta = pd.read_csv(args.metadata_csv)
 
-    X = emb[args.embedding_key]
+    if args.embedding_type == "cls":
+        X = emb["cls_embeddings"]
+    else:
+        X = emb["mean_token_embeddings"]
+
     y = emb["labels"]
+
+    print("Embedding:", X.shape)
+    print("Labels:", y.shape)
+    print("\nClass distribution:")
+    print(meta["label"].value_counts())
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     sil = silhouette_score(X_scaled, y, metric="euclidean")
-    print("Silhouette score:", sil)
+    print("\nSilhouette score:", sil)
 
-    train_mask = meta["split"] == "train"
-    val_mask = meta["split"] == "val"
-    test_mask = meta["split"] == "test"
+    train_mask = meta["split"].values == "train"
+    val_mask = meta["split"].values == "val"
+    test_mask = meta["split"].values == "test"
 
-    knn = KNeighborsClassifier(n_neighbors=5, metric="cosine")
-    knn.fit(X_scaled[train_mask], y[train_mask])
+    X_train = X_scaled[train_mask]
+    y_train = y[train_mask]
 
-    val_pred = knn.predict(X_scaled[val_mask])
-    test_pred = knn.predict(X_scaled[test_mask])
+    X_val = X_scaled[val_mask]
+    y_val = y[val_mask]
 
-    val_acc = accuracy_score(y[val_mask], val_pred)
-    test_acc = accuracy_score(y[test_mask], test_pred)
+    X_test = X_scaled[test_mask]
+    y_test = y[test_mask]
 
-    print("kNN val accuracy:", val_acc)
+    knn = KNeighborsClassifier(n_neighbors=args.k, metric="cosine")
+    knn.fit(X_train, y_train)
+
+    val_pred = knn.predict(X_val)
+    test_pred = knn.predict(X_test)
+
+    val_acc = accuracy_score(y_val, val_pred)
+    test_acc = accuracy_score(y_test, test_pred)
+
+    print("kNN validation accuracy:", val_acc)
     print("kNN test accuracy:", test_acc)
 
-    label_order = ["normal", "crackle", "wheeze", "both"]
-    label2id = {"normal": 0, "crackle": 1, "wheeze": 2, "both": 3}
-
     centroids = []
-    for label in label_order:
-        label_id = label2id[label]
+
+    for label in LABEL_ORDER:
+        label_id = LABEL2ID[label]
         centroids.append(X_scaled[y == label_id].mean(axis=0))
 
     centroids = np.stack(centroids, axis=0)
+
     dist_mat = pairwise_distances(centroids, metric="cosine")
 
-    centroid_df = pd.DataFrame(dist_mat, index=label_order, columns=label_order)
-    centroid_path = os.path.join(out_dir, f"centroid_cosine_distance_{args.embedding_key}.csv")
-    centroid_df.to_csv(centroid_path, encoding="utf-8-sig")
+    centroid_df = pd.DataFrame(
+        dist_mat,
+        index=LABEL_ORDER,
+        columns=LABEL_ORDER,
+    )
 
-    summary = pd.DataFrame([{
-        "embedding_key": args.embedding_key,
+    summary_df = pd.DataFrame([{
+        "embedding_type": args.embedding_type,
         "silhouette_score": sil,
+        "knn_k": args.k,
         "knn_val_accuracy": val_acc,
-        "knn_test_accuracy": test_acc
+        "knn_test_accuracy": test_acc,
     }])
-    summary_path = os.path.join(out_dir, f"representation_summary_{args.embedding_key}.csv")
-    summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
 
-    print("Saved:", centroid_path)
+    centroid_path = os.path.join(
+        args.output_dir,
+        f"centroid_cosine_distance_{args.embedding_type}.csv"
+    )
+    summary_path = os.path.join(
+        args.output_dir,
+        f"representation_summary_{args.embedding_type}.csv"
+    )
+
+    centroid_df.to_csv(centroid_path, encoding="utf-8-sig")
+    summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+
+    print("\nSaved:", centroid_path)
     print("Saved:", summary_path)
 
 
